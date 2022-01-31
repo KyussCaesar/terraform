@@ -35,10 +35,31 @@ variable "region" {
 
 # DATA SOURCES
 
+data "aws_vpc" "default" {
+  tags = {
+    Name = "aws-controltower-VPC"
+  }
+}
+
+data "aws_subnet_ids" "default" {
+  vpc_id = data.aws_vpc.default.id
+  filter {
+    name = "tag:Name"
+    values = [
+      "aws-controltower-PrivateSubnet1A"
+    ]
+  }
+}
+
 # RESOURCES
 
+locals {
+  global_name = "${var.prefix}-${var.component}-${terraform.workspace}-${var.region}"
+  name = "${var.prefix}-${var.component}-${terraform.workspace}"
+}
+
 resource "aws_s3_bucket" "bucket" {
-  bucket = "${var.prefix}-${var.component}-${terraform.workspace}-${var.region}"
+  bucket = local.global_name
 
   versioning {
     enabled = true
@@ -76,7 +97,7 @@ resource "aws_s3_bucket_public_access_block" "bucket" {
 }
 
 resource "aws_dynamodb_table" "table" {
-  name = "${var.prefix}-${var.component}-${terraform.workspace}"
+  name = "${var.component}"
   billing_mode = "PROVISIONED"
   hash_key = "LockID"
   # just in case account is compromised, attacker cannot cripple me by thrashing Dynamo
@@ -86,6 +107,20 @@ resource "aws_dynamodb_table" "table" {
     name = "LockID"
     type = "S"
   }
+}
+
+locals {
+  backend_configuration_file_name = "backend.tf"
+}
+
+resource "aws_s3_bucket_object" "backend" {
+  bucket = aws_s3_bucket.bucket.id
+  key = local.backend_configuration_file_name
+  content = <<EOF
+region = "${var.region}"
+bucket = "${aws_s3_bucket.bucket.id}"
+dynamodb_table = "${aws_dynamodb_table.table.id}"
+  EOF
 }
 
 data "aws_iam_policy_document" "policy" {
@@ -122,7 +157,7 @@ data "aws_iam_policy_document" "policy" {
 }
 
 resource "aws_iam_user" "user" {
-  name = "${var.prefix}-${var.component}-${terraform.workspace}-${var.region}"
+  name = local.global_name
 }
 
 resource "aws_iam_user_policy" "policy" {
@@ -130,16 +165,61 @@ resource "aws_iam_user_policy" "policy" {
   user = aws_iam_user.user.name
 }
 
+data "aws_iam_policy_document" "packer" {
+  statement {
+    actions = [
+      "sts:AssumeRole"
+    ]
+
+    principals {
+      type = "Service"
+      identifiers = [
+        "ec2.amazonaws.com"
+      ]
+    }
+  }
+}
+
+resource "aws_iam_role" "packer" {
+  name = "${local.name}-packer"
+  assume_role_policy = data.aws_iam_policy_document.packer.json
+  managed_policy_arns = [
+    # copied from quick start role
+    "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+    "arn:aws:iam::aws:policy/AmazonSSMPatchAssociation"
+  ]
+}
+
+resource "aws_iam_instance_profile" "packer" {
+  name = "${local.name}-packer"
+  role = aws_iam_role.packer.name
+}
+
+resource "aws_security_group" "packer" {
+  ingress {
+    from_port = 443
+    to_port = 443
+    protocol = "tcp"
+    cidr_blocks = [
+      data.aws_vpc.default.cidr_block
+    ]
+  }
+  name = "${local.name}-packer"
+  vpc_id = data.aws_vpc.default.id
+}
+
+resource "aws_vpc_endpoint" "packer" {
+  for_each = toset([
+    "ssm", "ec2messages", "ec2", "ssmmessages", "kms", "logs"
+  ])
+  service_name = "com.amazonaws.${var.region}.${each.value}"
+  vpc_id = data.aws_vpc.default.id
+  private_dns_enabled = true
+  subnet_ids = data.aws_subnet_ids.default.ids
+  security_group_ids = [
+    aws_security_group.packer.id
+  ]
+  vpc_endpoint_type = "Interface"
+}
+
 # OUTPUTS
-
-output "user" {
-  value = aws_iam_user.user
-}
-
-output "backend-bucket" {
-  value = aws_s3_bucket.bucket.id
-}
-
-output "backend-region" {
-  value = var.region
-}
